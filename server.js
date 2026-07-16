@@ -45,6 +45,8 @@ async function initDb() {
   `);
 }
 
+const path = require('path');
+
 const app = express();
 // Skip JSON body-parsing for the webhook route — it needs the raw, unparsed body
 // to verify the signature (see express.raw() on that route below).
@@ -58,7 +60,13 @@ app.use(cors({
   methods: ['GET', 'POST']
 }));
 
-app.get('/', (req, res) => res.send('TXT to SRT license server is running.'));
+// Landing page + policy pages (public/index.html, privacy.html, terms.html, refund.html)
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('/privacy', (req, res) => res.sendFile(path.join(__dirname, 'public', 'privacy.html')));
+app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'public', 'terms.html')));
+app.get('/refund', (req, res) => res.sendFile(path.join(__dirname, 'public', 'refund.html')));
+
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 // Verifies a Google OAuth access token directly with Google and returns the
 // verified email, or null if the token is invalid/expired.
