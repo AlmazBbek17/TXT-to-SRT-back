@@ -3,6 +3,7 @@
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const DodoPayments = require('dodopayments').default;
 
 const PORT = process.env.PORT || 3000;
 const EXTENSION_ID = process.env.EXTENSION_ID || 'hmegdmljjhbohphjhfogpgbhcfjkifbh';
@@ -16,6 +17,15 @@ const DODO_LINKS = {
 const PLAN_DURATION_DAYS = { monthly: 30, yearly: 365, lifetime: null };
 
 const DODO_WEBHOOK_SECRET = process.env.DODO_WEBHOOK_SECRET || '';
+const DODO_API_KEY = process.env.DODO_API_KEY || '';
+const DODO_ENVIRONMENT = process.env.DODO_ENVIRONMENT || 'live_mode'; // or 'test_mode'
+
+// Used only to verify webhook signatures via the official SDK — not for making API calls.
+const dodoClient = new DodoPayments({
+  bearerToken: DODO_API_KEY || 'placeholder',
+  environment: DODO_ENVIRONMENT,
+  webhookKey: DODO_WEBHOOK_SECRET
+});
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -36,7 +46,12 @@ async function initDb() {
 }
 
 const app = express();
-app.use(express.json());
+// Skip JSON body-parsing for the webhook route — it needs the raw, unparsed body
+// to verify the signature (see express.raw() on that route below).
+app.use((req, res, next) => {
+  if (req.path === '/api/webhook/dodo') return next();
+  express.json()(req, res, next);
+});
 
 app.use(cors({
   origin: [`chrome-extension://${EXTENSION_ID}`],
@@ -113,18 +128,42 @@ app.get('/api/checkout', async (req, res) => {
   res.redirect(url);
 });
 
-// Dodo Payments webhook — set this URL in the Dodo dashboard for "payment succeeded".
-// NOTE: verify the signature header per Dodo's docs before trusting the payload in production.
-app.post('/api/webhook/dodo', express.json({ type: '*/*' }), async (req, res) => {
+// Dodo Payments webhook — set this URL in the Dodo dashboard for payment/subscription events.
+// IMPORTANT: this route needs the RAW request body to verify the signature (not JSON-parsed).
+app.post('/api/webhook/dodo', express.raw({ type: '*/*' }), async (req, res) => {
+  let event;
   try {
-    // TODO: verify req.headers['dodo-signature'] (or whatever header Dodo uses) against
-    // DODO_WEBHOOK_SECRET before trusting the body — placeholder until Dodo's exact docs are in hand.
+    event = await dodoClient.webhooks.unwrap(req.body.toString(), {
+      headers: {
+        'webhook-id': req.headers['webhook-id'],
+        'webhook-signature': req.headers['webhook-signature'],
+        'webhook-timestamp': req.headers['webhook-timestamp']
+      }
+    });
+  } catch (e) {
+    console.error('webhook signature verification failed', e.message);
+    return res.status(401).json({ error: 'invalid signature' });
+  }
 
-    const email = (req.body?.data?.customer?.email || req.body?.email || '').trim().toLowerCase();
-    // Which plan the customer bought — adjust this path once you see a real Dodo payload;
-    // for now also accept it as an explicit query param so you can test manually.
-    const plan = (req.body?.data?.plan || req.body?.plan || req.query.plan || 'lifetime').trim().toLowerCase();
+  try {
+    const type = event?.type || '';
+    const d = event?.data || {};
+    const email = (d?.customer?.email || '').trim().toLowerCase();
     if (!email) return res.status(400).json({ error: 'no email in payload' });
+
+    // Only act on events that mean "this person now has an active paid plan".
+    const RELEVANT = ['payment.succeeded', 'subscription.active', 'subscription.renewed'];
+    if (!RELEVANT.includes(type)) return res.json({ ok: true, ignored: type });
+
+    // Dodo's payment payload has no explicit "plan" field — infer it:
+    // no subscription_id at all => one-time purchase => lifetime.
+    // otherwise it's a subscription => tell monthly/yearly apart by amount charged.
+    let plan = 'lifetime';
+    if (d.subscription_id) {
+      const amount = d.total_amount ?? d.settlement_amount ?? 0;
+      // amounts are in cents. Adjust these if your live prices differ from $3/$10.
+      plan = amount >= 1000 ? 'yearly' : 'monthly';
+    }
 
     const days = PLAN_DURATION_DAYS[plan];
     const expiresAt = days ? new Date(Date.now() + days * 86400000).toISOString() : null;
@@ -135,12 +174,13 @@ app.post('/api/webhook/dodo', express.json({ type: '*/*' }), async (req, res) =>
       [email, plan, expiresAt]
     );
 
-    res.json({ ok: true });
+    res.json({ ok: true, email, plan });
   } catch (e) {
-    console.error('webhook error', e);
+    console.error('webhook processing error', e);
     res.status(500).json({ error: 'internal error' });
   }
 });
+
 
 initDb()
   .then(() => app.listen(PORT, () => console.log(`License server listening on ${PORT}`)))
