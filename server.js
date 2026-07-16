@@ -45,10 +45,29 @@ app.use(cors({
 
 app.get('/', (req, res) => res.send('TXT to SRT license server is running.'));
 
-// Create/update a user record. Called right before opening the paywall / checkout.
+// Verifies a Google OAuth access token directly with Google and returns the
+// verified email, or null if the token is invalid/expired.
+async function verifyGoogleToken(token) {
+  try {
+    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!res.ok) return null;
+    const info = await res.json();
+    return info.email ? info.email.trim().toLowerCase() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Verifies the OAuth token sent by the extension, then creates/looks up the user
+// keyed by the EMAIL GOOGLE RETURNED — the client never gets to just assert an email.
 app.post('/api/auth', async (req, res) => {
-  const email = (req.body.email || '').trim().toLowerCase();
-  if (!email) return res.status(400).json({ error: 'email required' });
+  const token = (req.body.token || '').trim();
+  if (!token) return res.status(400).json({ error: 'token required' });
+
+  const email = await verifyGoogleToken(token);
+  if (!email) return res.status(401).json({ error: 'invalid or expired Google token' });
 
   await pool.query(
     `INSERT INTO users (email) VALUES ($1) ON CONFLICT (email) DO NOTHING`,
